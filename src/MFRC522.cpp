@@ -176,11 +176,13 @@ MFRC522::StatusCode MFRC522::PCD_CalculateCRC(	byte *data,		///< In: Pointer to 
 	PCD_WriteRegister(FIFODataReg, length, data);	// Write data to the FIFO
 	PCD_WriteRegister(CommandReg, PCD_CalcCRC);		// Start the calculation
 	
-	// Wait for the CRC calculation to complete. Each iteration of the while-loop takes 17.73μs.
-	// TODO check/modify for other architectures than Arduino Uno 16bit
+	// Wait for the CRC calculation to complete. Check for the register to
+	// indicate that the CRC calculation is complete in a loop. If the
+	// calculation is not indicated as complete in ~90ms, then time out
+	// the operation.
+	const uint32_t deadline = millis() + 89;
 
-	// Wait for the CRC calculation to complete. Each iteration of the while-loop takes 17.73us.
-	for (uint16_t i = 5000; i > 0; i--) {
+	do {
 		// DivIrqReg[7..0] bits are: Set2 reserved reserved MfinActIRq reserved CRCIRq reserved reserved
 		byte n = PCD_ReadRegister(DivIrqReg);
 		if (n & 0x04) {									// CRCIRq bit set - calculation done
@@ -190,8 +192,11 @@ MFRC522::StatusCode MFRC522::PCD_CalculateCRC(	byte *data,		///< In: Pointer to 
 			result[1] = PCD_ReadRegister(CRCResultRegH);
 			return STATUS_OK;
 		}
+		yield();
 	}
-	// 89ms passed and nothing happend. Communication with the MFRC522 might be down.
+	while (static_cast<uint32_t> (millis()) < deadline);
+
+	// 89ms passed and nothing happened. Communication with the MFRC522 might be down.
 	return STATUS_TIMEOUT;
 } // End PCD_CalculateCRC()
 
@@ -405,6 +410,11 @@ bool MFRC522::PCD_PerformSelfTest() {
 		}
 	}
 	
+	// 8. Perform a re-init, because PCD does not work after test.
+	// Reset does not work as expected.
+	// "Auto self-test done" does not work as expected.
+	PCD_Init();
+	
 	// Test passed; all is good.
 	return true;
 } // End PCD_PerformSelfTest()
@@ -435,6 +445,7 @@ void MFRC522::PCD_SoftPowerUp(){
 		if(!(val & (1<<4))){ // if powerdown bit is 0 
 			break;// wake up procedure is finished 
 		}
+		yield();
 	}
 }
 
@@ -490,22 +501,32 @@ MFRC522::StatusCode MFRC522::PCD_CommunicateWithPICC(	byte command,		///< The co
 		PCD_SetRegisterBitMask(BitFramingReg, 0x80);	// StartSend=1, transmission of data starts
 	}
 	
-	// Wait for the command to complete.
-	// In PCD_Init() we set the TAuto flag in TModeReg. This means the timer automatically starts when the PCD stops transmitting.
-	// Each iteration of the do-while-loop takes 17.86μs.
-	// TODO check/modify for other architectures than Arduino Uno 16bit
-	uint16_t i;
-	for (i = 2000; i > 0; i--) {
+	// In PCD_Init() we set the TAuto flag in TModeReg. This means the timer
+	// automatically starts when the PCD stops transmitting.
+	//
+	// Wait here for the command to complete. The bits specified in the
+	// `waitIRq` parameter define what bits constitute a completed command.
+	// When they are set in the ComIrqReg register, then the command is
+	// considered complete. If the command is not indicated as complete in
+	// ~36ms, then consider the command as timed out.
+	const uint32_t deadline = millis() + 36;
+	bool completed = false;
+
+	do {
 		byte n = PCD_ReadRegister(ComIrqReg);	// ComIrqReg[7..0] bits are: Set1 TxIRq RxIRq IdleIRq HiAlertIRq LoAlertIRq ErrIRq TimerIRq
 		if (n & waitIRq) {					// One of the interrupts that signal success has been set.
+			completed = true;
 			break;
 		}
 		if (n & 0x01) {						// Timer interrupt - nothing received in 25ms
 			return STATUS_TIMEOUT;
 		}
+		yield();
 	}
-	// 35.7ms and nothing happend. Communication with the MFRC522 might be down.
-	if (i == 0) {
+	while (static_cast<uint32_t> (millis()) < deadline);
+
+	// 36ms and nothing happened. Communication with the MFRC522 might be down.
+	if (!completed) {
 		return STATUS_TIMEOUT;
 	}
 	
@@ -1294,7 +1315,7 @@ const __FlashStringHelper *MFRC522::GetStatusCodeName(MFRC522::StatusCode code	/
 	switch (code) {
 		case STATUS_OK:				return F("Success.");
 		case STATUS_ERROR:			return F("Error in communication.");
-		case STATUS_COLLISION:		return F("Collission detected.");
+		case STATUS_COLLISION:		return F("Collision detected.");
 		case STATUS_TIMEOUT:		return F("Timeout in communication.");
 		case STATUS_NO_ROOM:		return F("A buffer is not big enough.");
 		case STATUS_INTERNAL_ERROR:	return F("Internal error in the code. Should not happen.");
@@ -1730,7 +1751,7 @@ bool MFRC522::MIFARE_OpenUidBackdoor(bool logErrors) {
 	byte validBits = 7; /* Our command is only 7 bits. After receiving card response,
 						  this will contain amount of valid response bits. */
 	byte response[32]; // Card's response is written here
-	byte received;
+	byte received = sizeof(response);
 	MFRC522::StatusCode status = PCD_TransceiveData(&cmd, (byte)1, response, &received, &validBits, (byte)0, false); // 40
 	if(status != STATUS_OK) {
 		if(logErrors) {
